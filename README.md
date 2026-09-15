@@ -1,252 +1,164 @@
 # oficina-infra-db
 
-Infraestrutura como código do **banco de dados gerenciado** da Oficina Mecânica
-(Tech Challenge 13SOAT — Fase 3). Provisiona a VPC compartilhada pelos demais
-repositórios, a instância **Amazon RDS PostgreSQL** e o segredo no **AWS Secrets
-Manager** consumido pela API e pela Lambda de autenticação.
+Terraform do **banco de dados** da Oficina Mecânica
+(Tech Challenge 13SOAT — Fase 3). Cria a rede (VPC) usada por todos os
+repositórios, o banco **PostgreSQL no Amazon RDS** e o **Secrets Manager** com
+as senhas.
 
-## Tecnologias
+## Links
 
-| Item | Escolha |
+| O quê | Link |
 |---|---|
-| IaC | Terraform >= 1.5, provider AWS ~> 5.0 |
-| Banco | Amazon RDS PostgreSQL 16, `db.t3.micro`, 20 GB gp3 criptografado |
-| Segredos | AWS Secrets Manager (credenciais do banco + `JWT_SECRET`) |
-| Rede | VPC 10.0.0.0/16, 2 AZs, subnets públicas e privadas, sem NAT Gateway |
-| State | Backend S3 com lock em DynamoDB |
-| CI/CD | GitHub Actions (`fmt`/`validate` no PR, `apply` no push) |
+| 🚪 API em produção (API Gateway) | https://q7m1gn8vqi.execute-api.us-east-1.amazonaws.com |
+| 🗂️ Diagrama ER e relacionamentos | [modelo-de-dados.md](https://github.com/Lorenalgm/oficina_mecanica/blob/main/docs/arquitetura/modelo-de-dados.md) |
+| 📝 Por que PostgreSQL (RFC-002) | [RFC-002](https://github.com/Lorenalgm/oficina_mecanica/blob/main/docs/rfcs/RFC-002-banco-de-dados.md) |
+| ⚙️ Código da API | [oficina_mecanica](https://github.com/Lorenalgm/oficina_mecanica) |
+| 🔐 Autenticação | [oficina-auth-lambda](https://github.com/Lorenalgm/oficina-auth-lambda) |
+| ☸️ Kubernetes | [oficina-infra-k8s](https://github.com/Lorenalgm/oficina-infra-k8s) |
+
+> O banco fica em rede privada, sem acesso pela internet. Só a API e a Lambda
+> de autenticação conseguem se conectar.
 
 ## Arquitetura
 
 ```mermaid
 flowchart LR
-  subgraph VPC["VPC 10.0.0.0/16"]
-    subgraph Pub["Subnets públicas (2 AZs)"]
-      NLB["NLB do ingress\n(oficina-infra-k8s)"]
-      Nodes["Nodes EKS\n(oficina-infra-k8s)"]
+    internet(["🌍 Internet"])
+
+    subgraph vpc["🔒 VPC — rede da oficina (2 zonas de disponibilidade)"]
+        direction LR
+
+        subgraph pub["🌐 Subnets públicas"]
+            direction TB
+            lb["Load Balancer<br/>entrada do cluster"]
+            nodes["⚙️ Nodes do EKS<br/>rodam a API"]
+        end
+
+        subgraph priv["🛡️ Subnets privadas — sem saída para a internet"]
+            direction TB
+            lambda["🪪 Lambdas<br/>de autenticação"]
+            db[("🐘 PostgreSQL 16<br/>RDS")]
+            vpce["🔌 Acesso privado<br/>ao Secrets Manager"]
+        end
     end
-    subgraph Priv["Subnets privadas (2 AZs) — sem rota default"]
-      RDS[("RDS PostgreSQL 16\ndb.t3.micro")]
-      ENI["ENIs das Lambdas\n(oficina-auth-lambda)"]
-      VPCE["VPC Endpoint\nSecrets Manager"]
-    end
-  end
-  IGW["Internet Gateway"] --- Pub
-  Nodes -->|5432| RDS
-  ENI -->|5432| RDS
-  ENI --> VPCE
-  VPCE --> SM["Secrets Manager\noficina/app"]
+
+    sm["🔑 Secrets Manager<br/>senha do banco e chave do token"]
+
+    internet --> lb
+    lb --> nodes
+    nodes -->|"porta 5432"| db
+    lambda -->|"porta 5432"| db
+    lambda --> vpce
+    vpce --> sm
+
+    style vpc fill:#f8fafc,stroke:#64748b,color:#0f172a
+    style pub fill:#eff6ff,stroke:#1d4ed8,color:#1e3a8a
+    style priv fill:#f0fdf4,stroke:#15803d,color:#14532d
+    classDef entry fill:#e2e8f0,stroke:#475569,color:#0f172a;
+    classDef app fill:#dbeafe,stroke:#2563eb,color:#1e3a8a;
+    classDef data fill:#dcfce7,stroke:#15803d,color:#14532d;
+    classDef sec fill:#f5d0fe,stroke:#a21caf,color:#701a75;
+    class internet entry;
+    class lb,nodes app;
+    class db data;
+    class lambda,vpce,sm sec;
 ```
+
+**Legenda:** 🟦 parte pública (API) · 🟩 banco · 🟪 autenticação e segredos
 
 ### Decisões de rede
 
-**Sem NAT Gateway.** Nada nas subnets privadas precisa de internet: o RDS é
-interno e a Lambda só fala com o banco e com o Secrets Manager. O acesso ao
-Secrets Manager sai por um **VPC endpoint de interface**, que custa uma fração
-do NAT. Isso importa porque o AWS Academy Learner Lab não interrompe NAT nem
-Load Balancer entre sessões — eles continuariam consumindo o orçamento de USD 50.
+- **Sem NAT Gateway.** Nada na parte privada precisa de internet. A Lambda
+  acessa o Secrets Manager por um endpoint privado, bem mais barato. Isso
+  importa porque o Learner Lab tem orçamento de USD 50.
+- **O banco começa fechado.** O firewall (security group) do RDS nasce sem
+  nenhuma regra de entrada. Cada repositório que precisa do banco libera o
+  próprio acesso. Assim este repositório não depende dos outros.
 
-**O security group do banco nasce sem `ingress`.** Cada consumidor cria a própria
-regra a partir do seu repositório, apontando para o `db_sg_id` publicado nos
-outputs. Assim o state deste repo não depende dos outros e não há ciclo.
+## Por que PostgreSQL
 
-## Justificativa formal do banco de dados
+Resumo da [RFC-002](https://github.com/Lorenalgm/oficina_mecanica/blob/main/docs/rfcs/RFC-002-banco-de-dados.md):
 
-O domínio é **fortemente relacional e transacional**. Uma ordem de serviço amarra
-cliente, veículo, catálogo de serviços, insumos com estoque, histórico de status e
-orçamento — e a operação central (aprovar um orçamento) precisa, no mesmo átomo,
-mudar o status da OS e **debitar o estoque de todos os insumos envolvidos**. Uma
-falha parcial aí produziria estoque incorreto, que é um erro contábil, não um erro
-de exibição.
+| Motivo | Exemplo no sistema |
+|---|---|
+| **Transações** | Aprovar um orçamento muda o status da OS, grava o histórico e baixa o estoque de todas as peças, tudo ou nada |
+| **Chaves estrangeiras** | 10 tabelas ligadas; não é possível apagar um serviço que está em uso numa OS |
+| **Consultas com agregação** | Tempo médio por status sai direto do histórico em SQL |
+| **Valores exatos** | Preços em `decimal(10,2)`, sem erro de arredondamento |
+| **Sem retrabalho** | A API já usava PostgreSQL na Fase 2 |
 
-Por isso a escolha é um banco **relacional com ACID**, e não um documental:
+**Por que RDS e não o banco dentro do cluster:** backup automático, disco
+criptografado, e os dados sobrevivem quando o cluster é destruído.
 
-- **Integridade referencial declarada no banco.** Todas as 8 tabelas de negócio se
-  ligam por chave estrangeira, com `ON DELETE CASCADE` onde a composição é real
-  (`os_servicos` e `os_status` não existem sem a `os`) e restrito onde não é
-  (não se apaga um `servico` do catálogo que esteja em uso). Em um banco
-  documental essa garantia viraria código de aplicação.
-- **Transações multi-tabela.** `AprovarOrcamento` atualiza `os_orcamentos`,
-  insere em `os_status`, atualiza `os.status_atual_id` e decrementa
-  `insumos.quantidade_estoque`. É uma transação ACID de livro.
-- **Agregações analíticas.** O requisito de "tempo médio de execução por status"
-  é uma janela sobre `os_status` (`LAG` / diferença entre timestamps
-  consecutivos) — trivial em SQL, custosa fora dele.
-- **Volume modesto e schema estável.** Dezenas de milhares de OS por ano, com
-  modelo conhecido. Não há pressão de escala horizontal que justifique abrir mão
-  de junções.
-
-**Por que PostgreSQL** entre os relacionais: é o que a aplicação já usava em
-container na Fase 2 (migração sem reescrever nada), tem tipos `numeric` exatos
-para valores monetários — `decimal(10,2)` em `servicos.valor`, `insumos.valor` e
-`os_orcamentos.valor_total`, onde ponto flutuante seria inaceitável —, funções de
-janela maduras para as métricas, e está no free tier do RDS em `db.t3.micro`.
-
-**Por que gerenciado (RDS) e não um StatefulSet:** backup automático, storage
-criptografado, patching e a separação entre o ciclo de vida do dado e o do
-cluster. Na Fase 2 o Postgres vivia dentro do kind e morria junto com ele.
-
-### Modelo de dados
+## Modelo de dados
 
 ```mermaid
 erDiagram
-  clientes ||--o{ veiculos : possui
-  clientes ||--o{ os : abre
-  veiculos ||--o{ os : origina
-  status   ||--o{ os : "status atual"
-  os       ||--o{ os_servicos : contem
-  os       ||--o{ os_status : historico
-  os       ||--o| os_orcamentos : orca
-  servicos ||--o{ os_servicos : catalogo
-  status   ||--o{ os_status : registra
-  os_servicos ||--o{ os_servico_insumos : consome
-  insumos     ||--o{ os_servico_insumos : fornece
-
-  clientes {
-    bigint id PK
-    string nome
-    string documento UK "CPF — chave da autenticação"
-    string celular
-    string email
-  }
-  veiculos {
-    bigint id PK
-    string placa UK
-    string marca
-    string modelo
-    int    ano
-    bigint cliente_id FK
-  }
-  servicos {
-    bigint  id PK
-    string  nome
-    decimal valor "10,2"
-  }
-  insumos {
-    bigint  id PK
-    string  nome
-    decimal valor "10,2"
-    int     quantidade_estoque
-  }
-  status {
-    bigint id PK
-    string nome "Recebida, Em diagnostico, Aguardando aprovacao, Em execucao, Finalizada, Entregue"
-  }
-  os {
-    bigint id PK
-    bigint veiculo_id FK
-    bigint cliente_id FK
-    bigint status_atual_id FK
-    text   descricao_problema
-  }
-  os_servicos {
-    bigint id PK
-    bigint os_id FK
-    bigint servico_id FK
-  }
-  os_servico_insumos {
-    bigint id PK
-    bigint os_servico_id FK
-    bigint insumo_id FK
-    int    quantidade
-  }
-  os_status {
-    bigint    id PK
-    bigint    os_id FK
-    bigint    status_id FK
-    timestamp data_status
-  }
-  os_orcamentos {
-    bigint    id PK
-    bigint    os_id FK
-    decimal   valor_total "10,2"
-    timestamp data_orcamento
-    timestamp data_aprovacao
-    string    status "pendente, aprovado, recusado"
-    string    approval_token
-  }
+  clientes ||--o{ veiculos : "possui"
+  clientes ||--o{ os : "abre"
+  veiculos ||--o{ os : "recebe"
+  status   ||--o{ os : "é o status atual de"
+  os       ||--o{ os_servicos : "inclui"
+  servicos ||--o{ os_servicos : "é usado em"
+  os_servicos ||--o{ os_servico_insumos : "consome"
+  insumos     ||--o{ os_servico_insumos : "é consumido em"
+  os       ||--o{ os_status : "tem histórico em"
+  status   ||--o{ os_status : "aparece em"
+  os       ||--o{ os_orcamentos : "recebe"
 ```
 
-**Relacionamentos que merecem explicação:**
+Colunas, regras de exclusão e explicação de cada relacionamento:
+[modelo-de-dados.md](https://github.com/Lorenalgm/oficina_mecanica/blob/main/docs/arquitetura/modelo-de-dados.md).
 
-- **`os.status_atual_id` convive com `os_status`.** A tabela `os_status` é o
-  histórico append-only (é dela que sai o tempo médio por status); a coluna em
-  `os` é a desnormalização deliberada do último registro, para que a listagem de
-  OS não precise de subconsulta correlacionada a cada linha.
-- **`os → os_servicos → os_servico_insumos` é uma cadeia, não duas N:N.** O
-  insumo é consumido por um *serviço dentro daquela OS*, não pela OS. Trocar um
-  serviço devolve exatamente os insumos dele.
-- **`os_orcamentos.approval_token`** permite ao cliente aprovar ou recusar por um
-  link sem autenticar — por isso é único e descartável, e não deriva do id.
-- **`clientes.documento` é `UNIQUE`** porque é a chave de entrada da Lambda de
-  autenticação: o CPF precisa resolver para no máximo um cliente.
+## Stack
 
-## Execução local
+| Item | Escolha |
+|---|---|
+| Infraestrutura como código | Terraform ≥ 1.5 |
+| Banco | Amazon RDS PostgreSQL 16, `db.t3.micro`, 20 GB criptografado |
+| Segredos | AWS Secrets Manager (`oficina/app`) |
+| Rede | VPC `10.0.0.0/16`, 2 zonas, subnets públicas e privadas |
+| Estado do Terraform | S3 com trava no DynamoDB |
+
+## Validar localmente
 
 ```bash
 cd terraform
-terraform init -backend=false      # validação sem tocar na AWS
+terraform init -backend=false
 terraform fmt -check -recursive
 terraform validate
 ```
 
 ## Deploy
 
-Pré-requisitos: bucket S3 e tabela DynamoDB de lock já existentes (criados uma
-única vez, fora do Terraform).
+Pré-requisito: bucket S3 e tabela DynamoDB para o estado do Terraform.
 
 ```bash
-export BUCKET=oficina-tfstate-<sufixo>
-export LOCK=oficina-tfstate-lock
-
 cd terraform
 terraform init \
-  -backend-config="bucket=$BUCKET" \
+  -backend-config="bucket=<bucket do state>" \
   -backend-config="region=us-east-1" \
-  -backend-config="dynamodb_table=$LOCK"
+  -backend-config="dynamodb_table=<tabela de trava>"
 
-terraform apply
-```
-
-O `apply` leva ~10 minutos (a criação do RDS domina). Ao final:
-
-```bash
+terraform apply                 # cerca de 10 minutos
 terraform output db_endpoint
-terraform output secret_arn
-aws secretsmanager get-secret-value --secret-id oficina/app --query SecretString --output text | jq .
 ```
 
-### AWS Academy Learner Lab
-
-As credenciais são temporárias e trocam a cada sessão de 4 horas. Antes de rodar
-qualquer `terraform`, cole o bloco de **AWS Details → AWS CLI → Show** em
-`~/.aws/credentials` (inclui `aws_session_token`). Para o GitHub Actions, os três
-secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e `AWS_SESSION_TOKEN`
-precisam ser atualizados na mesma frequência.
-
-O Learner Lab **não interrompe o RDS entre sessões** — ele continua cobrando.
-Enquanto não estiver usando:
+**No AWS Academy:** as credenciais mudam a cada sessão de 4 horas. O RDS
+continua cobrando entre sessões, então pause quando não estiver usando:
 
 ```bash
-aws rds stop-db-instance --db-instance-identifier oficina-db   # pausa por até 7 dias
+aws rds stop-db-instance  --db-instance-identifier oficina-db   # pausa por até 7 dias
 aws rds start-db-instance --db-instance-identifier oficina-db
 ```
 
 ## CI/CD
 
-| Workflow | Gatilho | O que faz |
+| Workflow | Quando roda | O que faz |
 |---|---|---|
-| `ci.yml` | pull request | `fmt -check`, `init -backend=false`, `validate` |
-| `cd.yml` | push em `main` / `develop` | `init` com backend remoto e `apply -auto-approve` |
+| `ci.yml` | pull request | Valida o Terraform |
+| `cd.yml` | push em `main` ou `develop` | Aplica o Terraform na AWS |
 
-`main` = produção, `develop` = homologação. A branch `main` é protegida: sem
-commit direto, PR obrigatório e o job de CI como status check exigido.
-
-## Repositórios relacionados
-
-| Repo | Papel |
-|---|---|
-| [`oficina-api`](../oficina-api) | Aplicação Laravel em Kubernetes |
-| [`oficina-auth-lambda`](../oficina-auth-lambda) | API Gateway + Lambdas de autenticação por CPF |
-| [`oficina-infra-k8s`](../oficina-infra-k8s) | EKS, ingress e agente do New Relic |
-| `oficina-infra-db` | **este repositório** |
+- `main` = produção, `develop` = homologação. A `main` só recebe código por pull request.
+- Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+  `TFSTATE_BUCKET`, `TFSTATE_LOCK_TABLE`.
