@@ -1,0 +1,43 @@
+name: CD
+
+on:
+  push:
+    branches: [main, develop]
+
+# Impede que dois deploys concorram pelo mesmo state do Terraform.
+concurrency: deploy-${{ github.ref_name }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'producao' || 'homologacao' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # O AWS Academy Learner Lab entrega credenciais temporárias que expiram
+          # a cada sessão; sem o token de sessão a chamada é rejeitada. Atualize
+          # os três secrets antes de rodar o deploy.
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION || 'us-east-1' }}" \
+            -backend-config="dynamodb_table=${{ secrets.TFSTATE_LOCK_TABLE }}"
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve -input=false
+
+      - name: Endpoint provisionado
+        working-directory: terraform
+        run: echo "RDS em $(terraform output -raw db_endpoint)"
