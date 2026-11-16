@@ -5,6 +5,11 @@ resource "random_password" "jwt" {
   special = false
 }
 
+resource "random_password" "interno" {
+  length  = 64
+  special = false
+}
+
 resource "aws_secretsmanager_secret" "app" {
   name = "${var.projeto}/app"
   # O Learner Lab reaproveita a conta entre execuções; sem isso, um destroy
@@ -18,11 +23,12 @@ resource "aws_secretsmanager_secret_version" "app" {
   secret_id = aws_secretsmanager_secret.app.id
 
   secret_string = jsonencode({
-    DB_HOST     = aws_db_instance.principal.address
-    DB_PORT     = aws_db_instance.principal.port
-    DB_DATABASE = var.db_nome
-    DB_USERNAME = var.db_usuario
-    DB_PASSWORD = random_password.db.result
-    JWT_SECRET  = random_password.jwt.result
+    DB_HOST            = aws_db_instance.principal.address
+    DB_PORT            = aws_db_instance.principal.port
+    DB_DATABASE        = var.db_nome
+    DB_USERNAME        = var.db_usuario
+    DB_PASSWORD        = random_password.db.result
+    JWT_SECRET         = random_password.jwt.result
+    INTERNAL_API_TOKEN = random_password.interno.result
   })
 }
