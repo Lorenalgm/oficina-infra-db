@@ -9,7 +9,7 @@ as senhas.
 
 | O quê | Link |
 |---|---|
-| 🚪 API em produção (API Gateway) | https://q7m1gn8vqi.execute-api.us-east-1.amazonaws.com |
+| 🚪 API em produção (API Gateway) | https://eme31yzdx6.execute-api.us-east-1.amazonaws.com |
 | 🗂️ Diagrama ER e relacionamentos | [modelo-de-dados.md](https://github.com/Lorenalgm/oficina_mecanica/blob/main/docs/arquitetura/modelo-de-dados.md) |
 | 📝 Por que PostgreSQL (RFC-002) | [RFC-002](https://github.com/Lorenalgm/oficina_mecanica/blob/main/docs/rfcs/RFC-002-banco-de-dados.md) |
 | ⚙️ Código da API | [oficina_mecanica](https://github.com/Lorenalgm/oficina_mecanica) |
